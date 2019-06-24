@@ -1,0 +1,19 @@
+Timer1_Init:
+	mov a, TMOD
+	anl a, #0xf0 ; Clear the bits for timer 0
+	orl a, #0x10 ; Configure timer 0 as 16-timer
+	mov TMOD, a
+	mov TH1, #high(TIMER0_RELOAD)
+	mov TL1, #low(TIMER0_RELOAD)
+	; Set autoreload value
+	mov TIMER1_RELOAD_H, #high(TIMER0_RELOAD)
+	mov TIMER1_RELOAD_L, #low(TIMER0_RELOAD)
+	; Enable the timer and interrupts
+     ; Enable timer 0 interrupt
+    setb ET1
+    setb TR1  ;Start timer 0
+	ret
+
+Timer1_ISR:
+	cpl SOUND_OUT ; Connect speaker to P3.7!
+	reti

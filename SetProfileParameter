@@ -1,0 +1,690 @@
+; Non_Blocking_FSM_example.asm:  Four FSMs are run in the forever loop.
+; Three FSMs are used to detect (with debounce) when either KEY1, KEY2, or
+; KEY3 are pressed.  The fourth FSM keeps a counter (Count3) that is incremented
+; every second.  When KEY1 is detected the program increments/decrements Count1,
+; depending on the position of SW0. When KEY2 is detected the program
+; increments/decrements Count2, also base on the position of SW0.  When KEY3
+; is detected, the program resets Count3 to zero.  
+;
+$NOLIST
+$MODDE1SOC
+$LIST
+
+CLK           EQU 33333333 ; Microcontroller system crystal frequency in Hz
+TIMER2_RATE   EQU 1000     ; 1000Hz, for a timer tick of 1ms
+TIMER2_RELOAD EQU ((65536-(CLK/(12*TIMER2_RATE))))
+
+; Reset vector
+org 0x0000
+    ljmp main
+
+; Timer/Counter 2 overflow interrupt vector
+org 0x002B
+	ljmp Timer2_ISR
+
+dseg at 0x30
+; Each FSM has its own timer
+FSM0_timer: ds 1	; not used yet
+FSM1_timer: ds 1
+FSM2_timer: ds 1
+FSM3_timer: ds 1
+FSM4_timer: ds 1
+; Each FSM has its own state counter
+FSM0_state: ds 0	; not used yet
+FSM1_state: ds 1
+FSM2_state: ds 1
+FSM3_state: ds 1
+FSM4_state: ds 1
+; Three counters to display.
+Count1:     ds 1 ; Incremented/decremented when KEY1 is pressed.
+Count2:     ds 2 ; Incremented/decremented when KEY2 is pressed.
+Count3:     ds 1 ; Incremented every second. Reset to zero when KEY3 is pressed
+
+;Increments or Decrements dependng on SW0 position
+profile_parameter:	ds 1 ; Profile Parameter is incremented/decremented when Key3 is pressed
+soak_temp:	 ds 1 ; Soak Temerature from [130,170] celcius is incremented/decremented when KEY2 is pressed and ProfileParameter = 0
+soak_time:   ds 1 ; Soak Time from [60,120] seconds is incremented/decremented when KEY2 is pressed and ProfileParameter = 1
+reflow_temp: ds 1 ; Reflow Temperature from [217,240] celcius is incremented/decremented when  KEY2 is pressed and ProfileParameter = 2
+reflow_time: ds 1 ; Reflow Time from [45,75] seconds is incremented/decremented when KEY2 is pressed and ProfileParameter = 3
+
+bcd: ds 8		  ; Varaible used to display in LCD, 
+				  ; RTI: bcd+1 & bcd+0 
+				  ; RTE: bcd+3 & bcd+2 
+				  ; STI: bcd+5 & bcd+4 
+				  ; STE: bcd+7 & bcd+6
+				  ; Profile: bcd+8
+bseg 
+; For each pushbutton we have a flag.  The corresponding FSM will set this
+; flags to one when a valid press of the pushbutton is detected.
+Key1_flag: dbit 1
+Key2_flag: dbit 1 ; For incrementing/decrementing parameters
+Key3_flag: dbit 1 ; For incrementing/decrementing ProfileParamter 
+
+cseg
+; These 'equ' must match the wiring between the DE1-SoC board and the LCD!
+; P0 is in connector JP2.  Check "CV-8052 Soft Processor in the DE1-SoC Board: Getting
+; Started Guide" for the details.
+ELCD_RS equ P0.4
+ELCD_RW equ P0.5
+ELCD_E  equ P0.6
+ELCD_D4 equ P0.0
+ELCD_D5 equ P0.1
+ELCD_D6 equ P0.2
+ELCD_D7 equ P0.3
+
+$NOLIST
+$include(LCD_4bit_DE1SoC.inc) ; A library of LCD related functions and utility macros
+$LIST
+
+RTI:  db 'RI:xxxx', 0  ;RTI means Reflow tIme
+RTE:  db 'RM:xxxx', 0  ;RTE means Reflow teMperature
+STI:  db 'SI:xxxx', 0  ;STI means Soak tIme
+STE:  db 'SM:xxxx', 0  ;STE means Soak teMperature
+;---------------------------------;
+; Routine to initialize the ISR   ;
+; for timer 2                     ;
+;---------------------------------;
+Timer2_Init:
+	mov T2CON, #0 ; Stop timer/counter.  Autoreload mode.
+	mov TH2, #high(TIMER2_RELOAD)
+	mov TL2, #low(TIMER2_RELOAD)
+	; Set the reload value
+	mov RCAP2H, #high(TIMER2_RELOAD)
+	mov RCAP2L, #low(TIMER2_RELOAD)
+	; Enable the timer and interrupts
+    setb ET2  ; Enable timer 2 interrupt
+    setb TR2  ; Enable timer 2
+	ret
+
+;---------------------------------;
+; ISR for timer 2.  Runs evere ms ;
+;---------------------------------;
+Timer2_ISR:
+	clr TF2  ; Timer 2 doesn't clear TF2 automatically. Do it in ISR
+	; Increment the timers for each FSM. That is all we do here!
+	inc FSM1_timer 
+	inc FSM2_timer 
+	inc FSM3_timer 
+	inc FSM4_timer 
+	reti
+
+; Look-up table for the 7-seg displays. (Segments are turn on with zero) 
+T_7seg:
+    DB 40H, 79H, 24H, 30H, 19H, 12H, 02H, 78H, 00H, 10H
+
+P_name:	
+			DW 'RI', 'RE', 'SI', 'SE'
+
+; Displays a BCD number pased in R0 in HEX1-HEX0
+Display_BCD_7_Seg_HEX10:
+	mov dptr, #T_7seg
+	
+
+	mov a, profile_parameter
+	swap a
+	anl a, #0FH
+	movc a, @a+dptr
+	mov HEX1, a
+	
+	
+	mov a, profile_parameter
+	anl a, #0FH
+	movc a, @a+dptr
+	mov HEX0, a
+	
+	ret
+
+; Displays a BCD number pased in R0 in HEX3-HEX2
+Display_BCD_7_Seg_HEX32:
+	mov dptr, #T_7seg
+	
+	mov bcd+1,R0	    ; For LCD display
+	mov a, R0
+	swap a
+	anl a, #0FH
+	movc a, @a+dptr
+	mov HEX3, a
+
+	
+	mov a, R0
+	anl a, #0FH
+	movc a, @a+dptr
+	mov HEX2, a
+;	mov bcd+1,a		    ; For LCD display
+	
+	ret
+
+; Displays a BCD number pased in R0 in HEX5-HEX4
+Display_BCD_7_Seg_HEX54:
+	mov dptr, #T_7seg
+
+	mov a, R0
+	swap a
+	anl a, #0FH
+	movc a, @a+dptr
+	mov HEX5, a
+	
+	mov a, R0
+	anl a, #0FH
+	movc a, @a+dptr
+	mov HEX4, a
+	
+	ret
+
+; The 8-bit hex number passed in the accumulator is converted to
+; BCD and stored in [R1, R0]
+Hex_to_bcd_8bit:
+	mov b, #100
+	div ab
+	mov R1, a   ; After dividing, a has the 100s
+	
+	mov a, b    ; Remainder is in register b
+	mov b, #10
+	div ab ; The tens are stored in a, the units are stored in b 
+	swap a
+	anl a, #0xf0
+	orl a, b
+	mov R0, a
+	
+	ret
+; The Hex_to_bcd_8bit routine converts the hex value in a variable and stores it into bcd 
+; so it can be displayed into LCD display
+;For Reflow Time
+Hex_to_bcd_8bit_RTI:
+	mov b, #100
+	div ab
+	mov bcd+1, a   ; After dividing, a has the 100s
+	
+	mov a, b    ; Remainder is in register b
+	mov b, #10
+	div ab ; The tens are stored in a, the units are stored in b 
+	swap a
+	anl a, #0xf0
+	orl a, b
+	mov bcd+0, a
+	
+	ret
+;For Reflow Temperature
+Hex_to_bcd_8bit_RTE:
+	mov b, #100
+	div ab
+	mov bcd+3, a   ; After dividing, a has the 100s
+	
+	mov a, b    ; Remainder is in register b
+	mov b, #10
+	div ab ; The tens are stored in a, the units are stored in b 
+	swap a
+	anl a, #0xf0
+	orl a, b
+	mov bcd+2, a
+	
+	ret
+;For Soak Time
+Hex_to_bcd_8bit_STI:
+	mov b, #100
+	div ab
+	mov bcd+5, a   ; After dividing, a has the 100s
+	
+	mov a, b    ; Remainder is in register b
+	mov b, #10
+	div ab ; The tens are stored in a, the units are stored in b 
+	swap a
+	anl a, #0xf0
+	orl a, b
+	mov bcd+4, a
+	
+	ret
+;For Soak Temperature
+Hex_to_bcd_8bit_STE:
+	mov b, #100
+	div ab
+	mov bcd+7, a   ; After dividing, a has the 100s
+	
+	mov a, b    ; Remainder is in register b
+	mov b, #10
+	div ab ; The tens are stored in a, the units are stored in b 
+	swap a
+	anl a, #0xf0
+	orl a, b
+	mov bcd+6, a
+	
+	ret
+
+;For profile parameter
+Hex_to_bcd_8bit_PRO:
+	mov b, #100
+	div ab
+	mov bcd+8, a   ; After dividing, a has the 100s
+	
+	mov a, b    ; Remainder is in register b
+	mov b, #10
+	div ab ; The tens are stored in a, the units are stored in b 
+	swap a
+	anl a, #0xf0
+	orl a, b
+	mov bcd+8, a
+	
+	ret
+
+;---------------------------------;
+; Main program. Includes hardware ;
+; initialization and 'forever'    ;
+; loop.							  ;		                          
+;---------------------------------;
+;SW0 for increment/decrement
+;Key1 to incremet/decrement profile parameter
+;Key2 to increment/decrement profile parameter to choose 
+;The parameters eg. 'reflow_time' variable contains the values that is used for condition jump in the FSM,
+;but to display the parameters variables in the LCD, it must be moved to a different variable, eg. bcd+0, especially if
+;the variable is in hundreds. 
+main:
+	; Initialization of hardware
+    mov SP, #0x7F
+    lcall Timer2_Init
+    ; Turn off all the LEDs
+    mov LEDRA, #0 ; LEDRA is bit addressable
+    mov LEDRB, #0 ; LEDRB is NOT bit addresable
+    setb EA   ; Enable Global interrupts
+    
+    ; We use the pins of P0 to control the LCD.  Configure as outputs.
+    mov P0MOD, #01111111b ; P0.0 to P0.6 are outputs.  ('1' makes the pin output)
+    ; We use pins P1.0 and P1.1 as outputs also.  Configure accordingly.
+    mov P1MOD, #00000011b ; P1.0 and P1.0 are outputs
+    ; Turn off all the LEDs
+    mov LEDRA, #0 ; LEDRA is bit addressable
+    mov LEDRB, #0 ; LEDRB is NOT bit addresable
+    setb EA   ; Enable Global interrupts
+   lcall ELCD_4BIT ; Configure LCD in four bit mode, it's in the inc file
+    
+    ; Initialize variables
+    mov FSM1_state, #0
+    mov FSM2_state, #0
+    mov FSM3_state, #0
+    mov FSM4_state, #0
+    mov reflow_time, #45
+    mov reflow_temp, #217
+    mov soak_time, #60
+    mov soak_temp, #130
+    mov profile_parameter, #0
+    mov Count3, #0
+   ; mov bcd+0,  #0  ; initialize it otherwise it will display unintended values at start of program.
+   ; mov bcd+1,  #0
+    
+    Set_Cursor(1, 1)	;Template
+    Send_Constant_String(#RTI)
+    
+    Set_Cursor(2, 1)	;Template
+    Send_Constant_String(#RTE)
+    
+    Set_Cursor(1, 9)	;Template
+    Send_Constant_String(#STI)
+    
+    Set_Cursor(2, 9)	;Template
+    Send_Constant_String(#STE)
+    
+    
+    
+    ; Display the initial value of each counter
+    
+    mov a, reflow_time
+    lcall Hex_to_bcd_8bit_RTI ; Converts hex reflow temperature to bcd and stores it into bcd+2 and bcd+1
+	Set_Cursor(1, 4)				;For RTI, Reflow TIme
+	Display_BCD(bcd+1)
+	Display_BCD(bcd+0)
+		
+	; Converts hex reflow temperature to bcd and stores it into bcd+3 and bcd+1	
+	mov a, reflow_temp
+    lcall Hex_to_bcd_8bit_RTE  		
+	Set_Cursor(2, 4)	
+	Display_BCD(bcd+3)
+	Display_BCD(bcd+2)
+	
+	; Converts hex soak time to bcd and stores it into bcd+5 and bcd+4	
+	mov a, soak_time
+    lcall Hex_to_bcd_8bit_STI  		
+	Set_Cursor(1, 12)	
+	Display_BCD(bcd+5)
+	Display_BCD(bcd+4)
+	
+	; Converts hex soak temperature to bcd and stores it into bcd+7 and bcd+6	
+	mov a, soak_temp
+    lcall Hex_to_bcd_8bit_STE  		
+	Set_Cursor(2, 12)	
+	Display_BCD(bcd+7)
+	Display_BCD(bcd+6)
+	
+	
+    ; Converts hex profile parameter to bcd and stores it into bcd+2 and bcd+1
+    lcall Display_BCD_7_Seg_HEX10
+    mov a, profile_parameter
+    lcall Hex_to_bcd_8bit_PRO 		
+	
+	
+	
+    mov a, Count3
+    lcall Hex_to_bcd_8bit
+	lcall Display_BCD_7_Seg_HEX54
+	
+	
+	; After initialization the program stays in this 'forever' loop
+loop:
+
+;-------------------------------------------------------------------------------
+; non-blocking state machine for KEY1 starts here
+	mov a, FSM1_state
+FSM1_state0:
+	cjne a, #0, FSM1_state1 ; If FSM1_STATE is not zero jump to FSM1_state1
+	jb KEY.1, FSM1_done		; If KEY.1 is 1, ie not pressed, jump to FSM1_done which is FSM2_state0, the start of non-blocking state machine for KEY2
+	;Else if KEY.1 == 0, ie. pressed
+	mov FSM1_timer, #0		; Mov zero to FSM1_timer
+	inc FSM1_state			; increment FSM1_state
+	sjmp FSM1_done			; Jump to the start of non_blocking state machine for KEY2
+FSM1_state1:
+	cjne a, #1, FSM1_state2
+	; this is the debounce state
+	mov a, FSM1_timer
+	cjne a, #50, FSM1_done ; 50 ms passed?
+	inc FSM1_state
+	sjmp FSM1_done	
+FSM1_state2:
+	cjne a, #2, FSM1_state3
+	jb KEY.1, FSM1_state2b
+	inc FSM1_state
+	sjmp FSM1_done	
+FSM1_state2b:
+	mov FSM1_state, #0
+	sjmp FSM1_done
+FSM1_state3:
+	cjne a, #3, FSM1_done
+	jnb KEY.1, FSM1_done
+	setb Key1_flag ; Suscesfully detected a valid KEY1 press/release
+	mov FSM1_state, #0	
+FSM1_done:
+;-------------------------------------------------------------------------------
+
+;-------------------------------------------------------------------------------
+; non-blocking state machine for KEY2 starts here
+	mov a, FSM2_state
+FSM2_state0:
+	cjne a, #0, FSM2_state1
+	jb KEY.2, FSM2_done
+	mov FSM2_timer, #0
+	inc FSM2_state
+	sjmp FSM2_done
+FSM2_state1:
+	cjne a, #1, FSM2_state2
+	; this is the debounce state
+	mov a, FSM2_timer
+	cjne a, #50, FSM2_done ; 50 ms passed?
+	inc FSM2_state
+	sjmp FSM2_done	
+FSM2_state2:
+	cjne a, #2, FSM2_state3
+	jb KEY.2, FSM2_state2b
+	inc FSM2_state
+	sjmp FSM2_done	
+FSM2_state2b:
+	mov FSM2_state, #0
+	sjmp FSM2_done
+FSM2_state3:
+	cjne a, #3, FSM2_done
+	jnb KEY.2, FSM2_done
+	setb Key2_flag ; Suscesfully detected a valid KEY2 press/release
+	mov FSM2_state, #0	
+FSM2_done:
+;-------------------------------------------------------------------------------
+
+;-------------------------------------------------------------------------------
+; non-blocking state machine for KEY3 starts here
+	mov a, FSM3_state
+FSM3_state0:
+	cjne a, #0, FSM3_state1
+	jb KEY.3, FSM3_done
+	mov FSM3_timer, #0
+	inc FSM3_state
+	sjmp FSM3_done
+FSM3_state1:
+	cjne a, #1, FSM3_state2
+	; this is the debounce state
+	mov a, FSM3_timer
+	cjne a, #50, FSM3_done ; 50 ms passed?
+	inc FSM3_state
+	sjmp FSM3_done	
+FSM3_state2:
+	cjne a, #2, FSM3_state3
+	jb KEY.3, FSM3_state2b
+	inc FSM3_state
+	sjmp FSM3_done	
+FSM3_state2b:
+	mov FSM3_state, #0
+	sjmp FSM3_done
+FSM3_state3:
+	cjne a, #3, FSM3_done
+	jnb KEY.3, FSM3_done
+	setb Key3_flag ; Suscesfully detected a valid KEY3 press/release
+	mov FSM3_state, #0	
+FSM3_done:
+;-------------------------------------------------------------------------------
+
+;-------------------------------------------------------------------------------
+; non-blocking FSM for the one second counter starts here.
+	mov a, FSM4_state
+	mov LEDRA, #0
+FSM4_state0:
+	cjne a, #0, FSM4_state1
+	setb LEDRA.0 ; We are using the LEDs to debug in what state is this machine
+	mov a, FSM4_timer
+	cjne a, #250, FSM4_done ; 250 ms passed? (Since we are usend an 8-bit variable, we need to count 250 ms four times)
+	mov FSM4_timer, #0
+	inc FSM4_state
+	sjmp FSM4_done
+FSM4_state1:	
+	cjne a, #1, FSM4_state2
+	setb LEDRA.1
+	mov a, FSM4_timer
+	cjne a, #250, FSM4_done ; 250 ms passed?
+	mov FSM4_timer, #0
+	inc FSM4_state
+	sjmp FSM4_done
+FSM4_state2:	
+	cjne a, #2, FSM4_state3
+	setb LEDRA.2
+	mov a, FSM4_timer
+	cjne a, #250, FSM4_done ; 250 ms passed?
+	mov FSM4_timer, #0
+	inc FSM4_state
+	sjmp FSM4_done
+FSM4_state3:	
+	cjne a, #3, FSM4_done
+	setb LEDRA.3
+	mov a, FSM4_timer
+	cjne a, #250, FSM4_done ; 250 ms passed?
+	mov FSM4_timer, #0
+	mov FSM4_state, #0
+	mov a, Count3
+	cjne a, #59, IncCount3 ; Don't let the seconds counter pass 59
+	mov Count3, #0
+	sjmp DisplayCount3
+IncCount3:
+	inc Count3
+DisplayCount3:
+    mov a, Count3
+    lcall Hex_to_bcd_8bit
+	lcall Display_BCD_7_Seg_HEX54
+	mov FSM4_state, #0
+FSM4_done:
+
+;======================================================================================    
+
+; If KEY1 was detected, increment or decrement Count1.  Notice that we are displying only
+; the least two signicant digits of a counter that can have values from 0 to 255.
+	jbc Key1_flag, Check_parameters0 ; Check which parameter to increment
+	ljmp Skip_parameters			 ; Skip_parameters means KEY1 is not pressed so ignore any incremenent and check KEY presses again
+
+Check_parameters0:
+	mov a, profile_parameter
+	cjne a, #0, Check_parameters1 ;If it's 0 Increment reflow_time
+Increment_reflow_time:	
+	mov  a, reflow_time		
+	cjne a, #75, Increment0 ; If not at 75, we can increment.
+	jb 	 SWA.0,  Decrement_reflow_time ; If it is 75, does user want Decrement? If so, decrement.
+	mov  a, #45  			; Otherwise reset reflow time to 45
+	mov  reflow_time, a		; Let's move 45 to reflow time to make sure it the actual value of variable.
+	sjmp Display_reflow_time
+Increment0:			
+	jb 	 SWA.0,  Decrement_reflow_time ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc reflow_time
+	sjmp Display_reflow_time
+Decrement_reflow_time:
+	cjne a, #45, Decrement0  ; If reflow_time is not at 45, allow decrement
+	jnb  SWA.0,  Increment0  ; If it is 45, does user want Increment? If so, increment.
+	mov  a, #75 	  ; Otherwise reset reflow time to 75
+	mov  reflow_time, a	
+	sjmp Display_reflow_time
+Decrement0:	
+	jnb 	 SWA.0,  Increment_reflow_time ; Does user actually want decrement? If so decrement, otherwise Jump to Increment Routine.
+	dec reflow_time
+Display_reflow_time:	
+    mov a, reflow_time
+    lcall Hex_to_bcd_8bit_RTI
+	Set_Cursor(1, 4)					; For LCD display
+	Display_BCD(bcd+1)					; need bcd cause it gets funky if I just use reflow_time variable. Value is moved in bcd+0 at Hex_to_bcd_8bit routine.
+	Display_BCD(bcd+0)
+    ljmp Skip_parameters
+;-------------------------------------------------------------------------------
+; Check if user wants to increment reflow_temp profile (aka parameter)
+Check_parameters1:
+	mov a, profile_parameter
+	cjne a, #1, Check_parameters2;If it's 1 Increment reflow_time, Check_parameters2
+	
+Increment_reflow_temp:
+	mov  a, reflow_temp		
+	cjne a, #240, Increment1 ; If not at 240, we can increment.
+	jb 	 SWA.0,  Decrement_reflow_temp ; If it is 240, does user want Decrement? If so, decrement.
+	mov  a, #217  			; Otherwise reset reflow temp to 217
+	mov  reflow_temp, a		; Let's move 217 to reflow temp to make sure it the actual value of variable.
+	sjmp Display_reflow_temp
+Increment1:			
+	jb 	 SWA.0,  Decrement_reflow_temp ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc reflow_temp
+	sjmp Display_reflow_temp
+Decrement_reflow_temp:
+	cjne a, #217, Decrement1  ; If reflow_temp is not at 217, allow decrement
+	jnb  SWA.0,  Increment1  ; If it is 217, does user want Increment? If so, increment.
+	mov  a, #240 	  		 ; Otherwise reset reflow time to 240
+	mov  reflow_temp, a	
+	sjmp Display_reflow_temp
+Decrement1:	
+	jnb 	 SWA.0,  Increment_reflow_temp ; Does user actually want decrement? If so decrement, otherwise jump to Increment Routine.
+	dec reflow_temp
+Display_reflow_temp:	
+    mov a, reflow_temp
+	lcall Hex_to_bcd_8bit_RTE		; Puts the result from Hex_to_bcd conversion into bcd+1 and bcd+2
+	Set_Cursor(2, 4)	
+	Display_BCD(bcd+3)
+	Display_BCD(bcd+2)	
+	ljmp Skip_parameters
+
+;-------------------------------------------------------------------------------   
+; Check if user wants to increment soak time profile 
+Check_parameters2:
+	mov a, profile_parameter
+	cjne a, #2, Check_parameters3;If it's 2 Increment soak_time, Check_parameters3
+	
+Increment_soak_time:
+	mov  a, soak_time	
+	cjne a, #120, Increment2 ; If not at 240, we can increment.
+	jb 	 SWA.0,  Decrement_soak_time  ; If it is 240, does user want Decrement? If so, decrement.
+	mov  a, #60  			; Otherwise reset reflow temp to 217
+	mov  soak_time, a		; Let's move 217 to reflow temp to make sure it the actual value of variable.
+	sjmp Display_soak_time
+Increment2:			
+	jb 	 SWA.0,  Decrement_soak_time ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc soak_time
+	sjmp Display_soak_time
+Decrement_soak_time:
+	cjne a, #60, Decrement2  ; If soak_time is not at 217, allow decrement
+	jnb  SWA.0,  Increment2  ; If it is 217, does user want Increment? If so, increment.
+	mov  a, #120 	  		 ; Otherwise reset reflow time to 240
+	mov  soak_time, a	
+	sjmp Display_soak_time
+	
+Decrement2:	
+	jnb SWA.0,  Increment_soak_time ; Does user actually want decrement? If so decrement, otherwise jump to Increment Routine.
+	dec soak_time
+Display_soak_time:	
+    mov a, soak_time
+	lcall Hex_to_bcd_8bit_STI		; Puts the result from Hex_to_bcd conversion into bcd+5 and bcd+4
+	Set_Cursor(1, 12)	
+	Display_BCD(bcd+5)
+	Display_BCD(bcd+4)	
+	
+	ljmp Skip_parameters
+
+;-------------------------------------------------------------------------------   
+; Check if user wants to increment soak temperature profile 
+Check_parameters3:
+	mov a, profile_parameter
+	cjne a, #3, Skip_parameters;If it's 3 Increment soak_temp, else check for KEYS are pressed by jumping to Skip_parameters 
+	
+Increment_soak_temp:
+	mov  a, soak_temp	
+	cjne a, #170, Increment3 ; If not at 240, we can increment.
+	jb 	 SWA.0,  Decrement_soak_temp  ; If it is 240, does user want Decrement? If so, decrement.
+	mov  a, #130  			; Otherwise reset reflow temp to 217
+	mov  soak_temp, a		; Let's move 217 to reflow temp to make sure it the actual value of variable.
+	sjmp Display_soak_temp
+Increment3:			
+	jb 	 SWA.0,  Decrement_soak_temp ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc soak_temp
+	sjmp Display_soak_temp
+Decrement_soak_temp:
+	cjne a, #130, Decrement3  ; If soak_temp is not at 217, allow decrement
+	jnb  SWA.0,  Increment3  ; If it is 217, does user want Increment? If so, increment.
+	mov  a, #170 	  		 ; Otherwise reset reflow time to 240
+	mov  soak_temp, a	
+	sjmp Display_soak_temp
+	
+Decrement3:	
+	jnb SWA.0,  Increment_soak_temp ; Does user actually want decrement? If so decrement, otherwise jump to Increment Routine.
+	dec soak_temp
+Display_soak_temp:	
+    mov a, soak_temp
+	lcall Hex_to_bcd_8bit_STE		; Puts the result from Hex_to_bcd conversion into bcd+7 and bcd+6
+	Set_Cursor(2, 12)	
+	Display_BCD(bcd+7)
+	Display_BCD(bcd+6)	
+;------------------------------------------------------------------------------- 
+
+Skip_parameters:
+;======================================================================================    	
+; When KEY2 is pressed/released it resets the one second counter (Count3)
+;Selects profile parameter: reflow time, reflow temp, soak time, and reflow temp
+	jbc Key2_flag, Increment_profile_parameter
+	sjmp Skip_profile_parameter
+Increment_profile_parameter:
+	mov  a, profile_parameter		
+	cjne a, #3, Increment5 ; If not at 3, we can increment.
+	jb 	 SWA.0,  Decrement_profile_parameter ; If it is 3, does user want Decrement? If so, decrement.
+	mov  a, #0  			; Otherwise reset reflow temp to 0
+	mov  profile_parameter, a		; Let's move 0 to reflow temp to make sure it the actual value of variable.
+	sjmp Display_profile_parameter
+Increment5:			
+	jb 	 SWA.0,  Decrement_profile_parameter ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc profile_parameter
+	sjmp Display_profile_parameter
+Decrement_profile_parameter:
+	cjne a, #0, Decrement5  ; If profile_paramter is not at 0, allow decrement
+	jnb  SWA.0,  Increment5  ; If it is 0, does user want Increment? If so, increment.
+	mov  a, #3 	  		 ; Otherwise reset profile_paramter to 3
+	mov  profile_parameter, a	
+	sjmp Display_profile_parameter
+Decrement5:	
+	jnb 	 SWA.0,  Increment_profile_parameter ; Does user actually want decrement? If so decrement, otherwise jump to Increment Routine.
+	dec profile_parameter
+Display_profile_parameter:	
+	lcall Display_BCD_7_Seg_HEX10
+	
+Skip_profile_parameter:
+    ljmp loop
+END

@@ -1,0 +1,1259 @@
+; ISR_example_DE1SoC.asm:
+; a) Increments/decrements a BCD variable every half second using
+;    an ISR for timer 2.  Uses SW0 to decide.  Also 'blinks' LEDR0 every
+;    half a second.
+; b) Generates a 2kHz square wave at pin P1.0 using an ISR for timer 0.
+; c) In the 'main' loop it displays the variable incremented/decremented
+;    using the ISR for timer 2 on the LCD and the 7-segment displays.
+;    Also resets it to zero if the KEY1 pushbutton  is pressed.
+; d) Controls the LCD using general purpose pins P0.0 to P0.6.  Pins P0.0
+;    to P0.6 are configured as outputs.
+;
+$NOLIST
+$MODDE1SOC
+$LIST
+
+
+
+; Bits used to access the LTC2308 (Communicating with the ADC)
+LTC2308_MISO bit 0xF8 ; Read only bit
+LTC2308_MOSI bit 0xF9 ; Write only bit
+LTC2308_SCLK bit 0xFA ; Write only bit
+LTC2308_ENN  bit 0xFB ; Write only bit
+
+;These are used for Serial Communication. Timer 1 is used to generate baud rate for SPI
+CLK EQU 33333333 ; Microcontroller system crystal frequency in Hz
+BAUD EQU 57600   ; Max Baud rate by timer 1
+TIMER_1_RELOAD EQU (256-((2*CLK)/(12*32*BAUD)))
+TIMER_10ms EQU (65536-(CLK/(12*100)))
+
+;BAUD EQU 115200
+;TIMER_2_RELOAD EQU (65536-(CLK/(32*BAUD)))
+;TIMER_0_1ms EQU (65536-(CLK/(12*1000)))
+
+
+;These are from the Interrupt example
+;CLK           EQU 33333333 ; Microcontroller system crystal frequency in Hz
+TIMER0_RATE   EQU 4096     ; 2048Hz squarewave (peak amplitude of CEM-1203 speaker)
+TIMER0_RELOAD EQU ((65536-(CLK/(12*TIMER0_RATE)))) ; The prescaler in the CV-8052 is 12 unlike the AT89LP51RC2 where is 1.
+TIMER2_RATE   EQU 1000     ; 1000Hz, for a timer tick of 1ms
+TIMER2_RELOAD EQU ((65536-(CLK/(12*TIMER2_RATE))))
+
+SOUND_OUT     equ P1.0
+UPDOWN        equ SWA.0
+SSR_C         equ P2.4
+
+; BUTTONS PINs
+;BTN_START   equ     P2.4
+BTN_STATE   equ     P2.5
+BTN_UP      equ     P2.6
+BTN_DOWN    equ     P2.7
+
+; States
+RAMP2SOAK		equ     1
+PREHEAT_SOAK	equ     2
+RAMP2PEAK		equ     3
+REFLOW			equ     4
+COOLING			equ     5
+
+; Reset vector
+org 0x0000
+    ljmp main
+
+; External interrupt 0 vector (not used in this code)
+org 0x0003
+	reti
+
+; Timer/Counter 0 overflow interrupt vector
+org 0x000B
+	ljmp Timer0_ISR
+
+; External interrupt 1 vector (not used in this code)
+org 0x0013
+	reti
+
+; Timer/Counter 1 overflow interrupt vector (not used in this code)
+org 0x001B
+	reti
+
+; Serial port receive/transmit interrupt vector (not used in this code)
+org 0x0023 
+	reti
+	
+; Timer/Counter 2 overflow interrupt vector
+org 0x002B
+	ljmp Timer2_ISR
+
+; In the 8051 we can define direct access variables starting at location 0x30 up to location 0x7F
+dseg at 0x30
+Count1ms:     ds 2 ; Used to determine when half second has passed ; The BCD counter incrememted in the ISR and displayed in the main loop
+temp_soak: ds 2
+Time_soak: ds 3
+BCD_counter: ds 5
+alarm_counter: ds 2
+; These register definitions needed by 'math32.inc'
+x:   ds 4
+y:   ds 4
+bcd: ds 5
+Temp_refl: ds 2
+
+Time_refl: ds 3
+state:     ds 1
+sec:        ds 1
+min:   		ds 1 
+temp:      ds 2
+pwm:       ds 1
+
+; In the 8051 we have variables that are 1-bit in size.  We can use the setb, clr, jb, and jnb
+; instructions with these variables.  This is how you define a 1-bit variable:
+bseg
+half_seconds_flag: dbit 1 ; Set to one in the ISR every time 500 ms had passed
+mf: dbit 1		; math32.inc uses this too
+pwm_flag: dbit 1
+alarm_flag: dbit 1
+;Import math32.inc macros
+$NOLIST
+$include(math32.inc)
+$LIST
+
+cseg
+; These 'equ' must match the wiring between the DE1-SoC board and the LCD!
+; P0 is in connector JP2.  Check "CV-8052 Soft Processor in the DE1-SoC Board: Getting
+; Started Guide" for the details.
+ELCD_RS equ P0.4
+ELCD_RW equ P0.5
+ELCD_E  equ P0.6
+ELCD_D4 equ P0.0
+ELCD_D5 equ P0.1
+ELCD_D6 equ P0.2
+ELCD_D7 equ P0.3
+
+; LCD SCREEN
+;                     	1234567890123456
+msg_main_top:  		db 'State:-  T:--- C', 0  ;State: 1-5
+msg_main_btm: 		db '  Time: -- s   ', 0  ;elapsed time
+msg_soakTemp:       db 'Soak Temp:     <', 0
+msg_soakTime:       db 'Soak Time:     <', 0
+msg_reflowTemp:	    db 'Reflow Temp:   <', 0
+msg_reflowTime:	    db 'Reflow Time:   <', 0
+msg_temp:	        db '      --- C    >', 0
+msg_time:	        db '     --:--     >', 0
+
+msg_reset_top:		db '   Reset    ', 0
+msg_reset_btm:		db '   Stop oven    ', 0
+msg_abort_top:		db 'Oven temp not   ', 0
+msg_abort_btm:		db 'reached, abort! ', 0
+msg_done:         db '    Done     ', 0
+msg_blank:        db '                ', 0
+
+$NOLIST
+$include(LCD_4bit_DE1SoC.inc) ; A library of LCD related functions and utility macros
+$LIST
+
+;Initialize_Serial_Port:
+    ; Initialize serial port and baud rate using timer 2
+;	mov RCAP2H, #high(TIMER_2_RELOAD)
+;	mov RCAP2L, #low(TIMER_2_RELOAD)
+;	mov T2CON, #0x34 ; #00110100B
+;	mov SCON, #0x52 ; Serial port in mode 1, ren, txrdy, rxempty
+;	ret
+
+;Initializes Serial Port to communicate with SPI. Use timer 1 as timer 2 is already used for interrupt.	
+	Initialize_Serial_Port:
+	; Configure serial port and baud rate
+	clr TR1 ; Disable timer 1
+	anl TMOD, #0x0f ; Mask the bits for timer 1
+	orl TMOD, #0x20 ; Set timer 1 in 8-bit auto reload mode
+    orl PCON, #80H ; Set SMOD to 1
+	mov TH1, #low(TIMER_1_RELOAD)
+	mov TL1, #low(TIMER_1_RELOAD) 
+	setb TR1 ; Enable timer 1
+	mov SCON, #52H
+	ret
+
+;                     1234567890123456    <- This helps determine the location of the counter
+;Initial_Message:  db 'BCD_counter: xx ', 0
+
+;---------------------------------;
+; Routine to initialize the ISR   ;
+; for timer 0                     ;
+;---------------------------------;
+Timer0_Init:
+
+	mov a, TMOD
+	anl a, #0xf0 ; Clear the bits for timer 0
+	orl a, #0x01 ; Configure timer 0 as 16-timer
+	mov TMOD, a
+	mov TH0, #high(TIMER0_RELOAD)
+	mov TL0, #low(TIMER0_RELOAD)
+	; Enable the timer and interrupts
+    setb ET0  ; Enable timer 0 interrupt
+    setb TR0  ; Start timer 0
+	ret
+
+;---------------------------------;
+; ISR for timer 0.  Set to execute;
+; every 1/4096Hz to generate a    ;
+; 2048 Hz square wave at pin P3.7 ;
+;---------------------------------;
+Timer0_ISR:
+    jb pwm_flag, upover
+    
+   
+
+downover:
+    setb pwm_flag
+    setb SSR_C
+    ;cpl SOUND_OUT
+    mov TH0, pwm
+    clr TF0
+    clr a
+    ljmp check_alarm
+upover:
+    ;cpl SOUND_OUT
+    clr pwm_flag
+    clr SSR_C
+    mov a, #0FFH
+    clr c
+    subb a, PWM
+    mov TH0, a
+    clr TF0
+	
+	ljmp check_alarm
+	
+check_alarm:
+    jnb alarm_flag, return_0   
+    ;clr TF0  ; According to the data sheet this is done for us already.
+	mov TH0, #high(TIMER0_RELOAD) ; Timer 0 doesn't have autoreload in the CV-8052
+	mov TL0, #low(TIMER0_RELOAD)
+	cpl SOUND_OUT ; Connect speaker to P3.7!
+	
+return_0:
+	reti
+
+;--------------------------------;
+; Routine to initialize the ISR   ;
+; for timer 2                     ;
+;---------------------------------;
+Timer2_Init:
+	mov T2CON, #0 ; Stop timer/counter.  Autoreload mode.
+	mov TH2, #high(TIMER2_RELOAD)
+	mov TL2, #low(TIMER2_RELOAD)
+	; Set the reload value
+	mov RCAP2H, #high(TIMER2_RELOAD)
+	mov RCAP2L, #low(TIMER2_RELOAD)
+	; Init One millisecond interrupt counter.  It is a 16-bit variable made with two 8-bit parts
+	clr a
+	mov Count1ms+0, a
+	mov Count1ms+1, a
+	; Enable the timer and interrupts
+    setb ET2  ; Enable timer 2 interrupt
+    setb TR2  ; Enable timer 2
+	ret
+
+;---------------------------------;
+; ISR for timer 2                 ;
+;---------------------------------;
+Timer2_ISR:
+	clr TF2  ; Timer 2 doesn't clear TF2 automatically. Do it in ISR
+	cpl P1.1 ; To check the interrupt rate with oscilloscope. It must be precisely a 1 ms pulse.
+	
+	; The two registers used in the ISR must be saved in the stack
+	push acc
+	push psw
+	
+	; Increment the 16-bit one mili second counter
+	inc Count1ms+0    ; Increment the low 8-bits first
+	mov a, Count1ms+0 ; If the low 8-bits overflow, then increment high 8-bits
+	jnz Inc_Done
+	inc Count1ms+1
+
+Inc_Done:
+	; Check if half second has passed
+	mov a, Count1ms+0
+	cjne a, #low(1000), Timer2_ISR_done ; Warning: this instruction changes the carry flag!
+	mov a, Count1ms+1
+	cjne a, #high(1000), Timer2_ISR_done
+	
+	; 500 milliseconds have passed.  Set a flag so the main program knows
+	setb half_seconds_flag ; Let the main program know half second had passed
+	; Toggle LEDR0 so it blinks
+	cpl LEDRA.0
+	cpl TR0 ; Enable/disable timer/counter 0. This line creates a beep-silence-beep-silence sound.
+	; Reset to zero the milli-seconds counter, it is a 16-bit variable
+	clr a
+	mov Count1ms+0, a
+	mov Count1ms+1, a
+	; Increment the BCD counter
+	mov a, BCD_counter
+	jb UPDOWN, Timer2_ISR_decrement
+	add a, #0x01
+	sjmp Timer2_ISR_da
+Timer2_ISR_decrement:
+	add a, #0x99 ; Adding the 10-complement of -1 is like subtracting 1.
+Timer2_ISR_da:
+	da a ; Decimal adjust instruction.  Check datasheet for more details!
+	mov BCD_counter, a
+	mov a,sec
+	add a,#0x01
+	da a
+	mov sec,a
+	cjne a,#0x60,Timer2_ISR_done
+	mov sec,#0
+	mov a,min
+	add a,#1
+	da a
+	mov min,a
+Timer2_ISR_done:
+	pop psw
+	pop acc
+	reti
+
+; Look-up table for the 7-seg displays. (Segments are turn on with zero) 
+T_7seg:
+    DB 40H, 79H, 24H, 30H, 19H, 12H, 02H, 78H, 00H, 10H
+
+
+; Displays a BCD number in HEX1-HEX0
+Display_BCD_7_Seg:
+	
+	mov dptr, #T_7seg
+
+	; Display the channel in HEX5
+	mov a, b
+	anl a, #0x0f
+	movc a, @a+dptr
+	mov HEX5, a
+	
+	; Display [R3,R2] in HEX3, HEX2, HEX1, HEX0
+	mov a, R3
+	swap a
+	anl a, #0x0f
+	movc a, @a+dptr
+	mov HEX3, a
+	
+	mov a, R3
+	anl a, #0x0f
+	movc a, @a+dptr
+	mov HEX2, a
+	
+	mov a, R2
+	swap a
+	anl a, #0x0f
+	movc a, @a+dptr
+	mov HEX1, a
+	
+	mov a, R2
+	anl a, #0x0f
+	movc a, @a+dptr
+	mov HEX0, a
+	ret
+
+Waitlong:
+   push acc
+    setb alarm_flag
+   	Wait_Milli_Seconds(#250)
+	Wait_Milli_Seconds(#250)
+	Wait_Milli_Seconds(#250)
+	Wait_Milli_Seconds(#250)
+	clr alarm_flag
+	pop acc
+
+	ret
+
+Waitshort:
+	setb alarm_flag
+	Wait_Milli_Seconds(#250)
+	clr alarm_flag
+	ret
+	
+Sixbeep:
+   lcall Waitshort
+   Wait_Milli_Seconds(#250)
+   lcall Waitshort
+   Wait_Milli_Seconds(#250)
+   lcall Waitshort
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#250)
+    lcall Waitshort
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#250)
+    lcall Waitshort
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#250)
+    lcall Waitshort
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#250)
+   Wait_Milli_Seconds(#250)
+   lcall Waitshort
+
+	ret
+hex2bcd16:
+	clr a
+	mov R4, a ; Initialize BCD to 00-00-00 
+	mov R3, a
+	mov R2, a
+	mov R5, #16  ; Loop counter.
+
+hex2bcd16_L1:
+	; Shift binary left	
+	mov a, R1
+	mov c, acc.7 ; This way [R1,R0] remains unchanged!
+	mov a, R0
+	rlc a
+	mov R0, a
+	mov a, R1
+	rlc a
+	mov R1, a
+    
+	; Perform bcd + bcd + carry using BCD arithmetic
+	mov a, R2
+	addc a, R2
+	da a
+	mov R2, a
+	mov bcd+0,a
+	
+	mov a, R3
+	addc a, R3
+	da a
+	mov R3, a
+	mov bcd+1,a
+	
+	mov a, R4
+	addc a, R4
+	da a
+	mov R4, a
+	mov bcd+2,a
+
+	djnz R5, hex2bcd16_L1
+	
+	ret
+
+
+;Converts Voltage reading to Celsius and displays it on HEX Display
+Voltage2Temp:
+	;Store Result, CH0 reading to x
+	mov x+0, R0		;Mov result
+	mov x+1, R1
+	mov x+2, #0
+	mov x+3, #0
+	
+	;The operation
+	Load_y(804878)
+	lcall mul32
+	Load_y(10000000)
+	lcall div32
+	Load_y(23)
+	lcall add32
+	
+	mov R0, x+0	; x contains result of calculations
+	mov R1, x+1 ; We need to put back result to R0 and R1 because those are the registers hex2bcd16 uses.
+	
+	
+	ret
+ReadChannel:
+	push b
+	
+	mov b, #3 ; ADC channel we want to read pased in register b
+	lcall LTC2308_RW
+	Wait_Milli_Seconds(#1)
+	mov b, #3
+	lcall LTC2308_RW ; [R1,R0] has the 12-bits from the converter now
+	
+	pop b
+	ret
+	
+;Read Temperature from Channel 3 of ADC,converts the voltage reading to temperature,
+;then displays it on HEX display, LCD display, and Putty
+ReadConvertDisplay:
+
+	lcall ReadChannel	 	 ; Reads voltage on Channel 3
+	lcall Voltage2Temp	 	 ; Converts voltage reading to celsius
+	lcall hex2bcd16          ; Convert to bcd
+	lcall Display_BCD_7_Seg  ; Display using the 7-segment displays
+	lcall Display_to_LCD	 ; Displays temperature on LCD
+	lcall SendNumber	     ; Send to serial port
+	
+	
+	Wait_Milli_Seconds(#250) ; Need Delay otherwise LCD won't show temp
+	Wait_Milli_Seconds(#250)
+	ret
+	
+;This routine uses bitbang communication to read voltage on channel 3
+LTC2308_RW:
+    clr a 
+	clr	LTC2308_ENN ; Enable ADC
+
+    ; Send 'S/D', get bit 11
+    setb c ; S/D=1 for single ended conversion
+    lcall LTC2308_Toggle_Pins
+    mov acc.3, c
+    ; Send channel bit 0, get bit 10
+    mov c, b.2 ; O/S odd channel select
+    lcall LTC2308_Toggle_Pins
+    mov acc.2, c 
+    ; Send channel bit 1, get bit 9
+    mov c, b.0 ; S1
+    lcall LTC2308_Toggle_Pins
+    mov acc.1, c
+    ; Send channel bit 2, get bit 8
+    mov c, b.1 ; S0
+    lcall LTC2308_Toggle_Pins
+    mov acc.0, c
+    mov R1, a
+    
+    ; Now receive the lest significant eight bits
+    clr a 
+    ; Send 'UNI', get bit 7
+    setb c ; UNI=1 for unipolar output mode
+    lcall LTC2308_Toggle_Pins
+    mov acc.7, c
+    ; Send 'SLP', get bit 6
+    clr c ; SLP=0 for NAP mode
+    lcall LTC2308_Toggle_Pins
+    mov acc.6, c
+    ; Send '0', get bit 5
+    clr c
+    lcall LTC2308_Toggle_Pins
+    mov acc.5, c
+    ; Send '0', get bit 4
+    clr c
+    lcall LTC2308_Toggle_Pins
+    mov acc.4, c
+    ; Send '0', get bit 3
+    clr c
+    lcall LTC2308_Toggle_Pins
+    mov acc.3, c
+    ; Send '0', get bit 2
+    clr c
+    lcall LTC2308_Toggle_Pins
+    mov acc.2, c
+    ; Send '0', get bit 1
+    clr c
+    lcall LTC2308_Toggle_Pins
+    mov acc.1, c
+    ; Send '0', get bit 0
+    clr c
+    lcall LTC2308_Toggle_Pins
+    mov acc.0, c
+    mov R0, a
+
+	setb LTC2308_ENN ; Disable ADC
+
+	ret
+	
+LTC2308_Toggle_Pins:
+    mov LTC2308_MOSI, c
+    setb LTC2308_SCLK
+    mov c, LTC2308_MISO
+    clr LTC2308_SCLK
+    ret
+Initialize_LEDs:
+    ; Turn off LEDs
+	mov	LEDRA,#0x00
+	mov	LEDRB,#0x00
+	ret
+Initialize_ADC:
+	; Initialize SPI pins connected to LTC2308
+	clr	LTC2308_MOSI
+	clr	LTC2308_SCLK
+	setb LTC2308_ENN
+	ret
+	
+;This is for Displaying arithmetic results in LCD
+;It hides the zeros to the left of the Least significant byte of bcd data
+;eg, instead of displaying '0025' we only see '25' on LCD display.
+Left_blank mac
+	mov a, %0
+	anl a, #0xf0
+	swap a
+	jz Left_blank_%M_a
+	ljmp %1
+Left_blank_%M_a:
+	Display_char(#' ')
+	mov a, %0
+	anl a, #0x0f
+	jz Left_blank_%M_b
+	ljmp %1
+Left_blank_%M_b:
+	Display_char(#' ')
+endmac
+
+; Sends 10-digit BCD number in bcd to the LCD
+Display_to_LCD:
+	Set_Cursor(1, 12)
+	;Display_BCD(bcd+4)	; Not needed
+	;Display_BCD(bcd+3) ; Not needed
+	;Display_BCD(bcd+2)	; Not needed
+	Display_BCD(bcd+1)
+	Display_BCD(bcd+0)
+	Set_cursor(1,12)
+	Display_char(#' ')
+	
+	; Replace all the zeros to the left with blanks
+	Set_Cursor(2, 11)
+	;Left_blank(bcd+4, skip_blank) ; Not used
+	;Left_blank(bcd+3, skip_blank) ; Not used
+	;Left_blank(bcd+2, skip_blank) ; Not used
+	Left_blank(bcd+1, skip_blank)
+	mov a, bcd+0
+	anl a, #0f0h
+	swap a
+	jnz skip_blank
+	Display_char(#' ') 
+	skip_blank:
+	
+	ret
+
+;Used to send Character to putty
+putchar:
+	jbc	TI,putchar_L1
+	sjmp putchar
+putchar_L1:
+	mov	SBUF,a
+	ret
+
+; Send a 4-digit BCD number stored in [R3,R2] to the serial port	
+SendNumber:
+
+	;Indents the characters on putty to the left.
+	mov a, #'\r'
+	lcall putchar
+		
+	mov a, R3		
+	anl a, #0x0f
+	orl a, #'0'
+	lcall putchar
+	
+	mov a, R2
+	swap a
+	anl a, #0x0f
+	orl a, #'0'
+	lcall putchar
+	
+	mov a, R2
+	anl a, #0x0f
+	orl a, #'0'
+	lcall putchar
+	
+	mov a, #' '
+	lcall putchar
+	
+	mov a, #'C'
+	lcall putchar
+	ret
+;---------------------------------;
+; Main program. Includes hardware ;
+; initialization and 'forever'    ;
+; loop.                           ;
+;---------------------------------;
+main:
+	; Initializ ation
+    mov SP, #0x7F
+    
+    ;For Reading voltage on ADC Channel
+    lcall Initialize_LEDs			; Turns OFF LEDs
+    lcall Initialize_Serial_Port	; For SPI
+    lcall Initialize_ADC			; For ADC
+
+    
+    
+    lcall Timer0_Init
+    lcall Timer2_Init
+    ; We use the pins of P0 to control the LCD.  Configure as outputs.
+    mov P0MOD, #01111111b ; P0.0 to P0.6 are outputs.  ('1' makes the pin output)
+    ; We use pins P1.0 and P1.1 as outputs also.  Configure accordingly.
+    mov P1MOD, #00000011b ; P1.0 and P1.1 are outputs
+    mov P2MOD, #00011111b
+    ; Turn off all the LEDs
+    mov LEDRA, #0 ; LEDRA is bit addressable
+    mov LEDRB, #0 ; LEDRB is NOT bit addresable
+    setb EA   ; Enable Global interrupts
+    lcall ELCD_4BIT ; Configure LCD in four bit mode
+    ; For convenience a few handy macros are included in 'LCD_4bit_DE1SoC.inc':
+	mov BCD_counter, #0x00 ; Initialize counter to zero
+    mov temp_soak, #150;
+	mov Time_soak, #0x60;
+	mov pwm,#125 ;
+	mov state,#0 ;
+	mov sec,#0
+	mov min,#0
+	mov sec ,#0;
+	mov FSM1_state, #0
+    mov FSM2_state, #0
+    mov FSM3_state, #0
+    mov FSM4_state, #0
+    mov reflow_time, #45
+    mov reflow_temp, #217
+    mov soak_time, #60
+    mov soak_temp, #130
+    mov profile_parameter, #0
+    mov Count3, #0
+	clr SSR_C
+	setb pwm_flag
+	clr alarm_flag
+		Set_cursor(1, 1)
+    Send_Constant_String(#msg_main_top)
+    Set_cursor(2, 1)
+    Send_Constant_String(#msg_main_btm)
+    Set_cursor(1, 15)
+    Display_char(#0xDF)
+    setb half_seconds_flag
+	; After initialization the program stays in this 'forever' loop
+loop:
+	jb KEY.1, loop_a  ; if the KEY1 button is not pressed skip
+	Wait_Milli_Seconds(#50)	; Debounce delay.  This macro is also in 'LCD_4bit_DE1SoC.inc'
+	jb KEY.1, loop_a  ; if the KEY1 button is not pressed skip
+	jnb KEY.1, $		; Wait for button release.  The '$' means: jump to same instruction.
+	; A valid press of the 'BOOT' button has been detected, reset the BCD counter.
+	; But first stop timer 2 and reset the milli-seconds counter, to resync everything.
+	clr TR2 ; Stop timer 2
+	clr a
+	mov Count1ms+0, a
+	mov Count1ms+1, a
+	; Now clear the BCD counter
+	mov BCD_counter, a
+	setb TR2    ; Start timer 2
+	sjmp loop_b ; Display the new value
+loop_a:
+	jnb half_seconds_flag, loop
+loop_b:
+	jb KEY.2, loop_m  ; if the KEY1 button is not pressed skip
+	Wait_Milli_Seconds(#50)	; Debounce delay.  This macro is also in 'LCD_4bit_DE1SoC.inc'
+	jb KEY.2, loop_m  ; if the KEY1 button is not pressed skip
+	jnb KEY.2, $		; Wait for button release.  The '$' means: jump to same instruction.
+	ljmp loop_con
+loop_m:
+    clr half_seconds_flag ; We clear this flag in the main loop, but it is set in the ISR for timer 2
+	Set_Cursor(2, 9)     ; the place in the LCD where we want the BCD counter value
+	Display_BCD(sec) ; This macro is also in 'LCD_4bit_DE1SoC.inc'
+	Set_Cursor(2, 15)
+	Display_BCD(min)  
+	lcall ReadConvertDisplay; Reads voltage on ADC channel, converts it to temperature, and then Display  Reading on Hex Display, LCD Display, and Putty
+	
+    mov temp+0, r0
+	mov temp+1 ,r1
+	
+	
+	
+
+start0:
+    jb KEY.1,start
+	jnb KEY.1,$
+	mov state,#0
+start:
+	mov a, state
+state0:
+    cjne a, #0, state1
+    push acc
+    mov a, #0x40
+    mov HEX4, a
+    pop acc
+    mov pwm, #255
+    jb KEY.3, state0_done
+    jnb KEY.3, $ ; Wait for key release
+    mov state, #1
+    lcall Waitshort
+state0_done:
+	Set_cursor(1, 7)
+	mov		a, state
+	Display_BCD(a)
+    ljmp loop_b
+	
+state1:   
+    cjne a, #1, state2
+    push acc
+    mov a, #0x79
+    mov HEX4, a
+    pop acc 
+    mov pwm, #0
+    mov sec, #0
+    mov a, temp_soak  
+    clr c
+    subb a, temp
+    jnc state1_done
+    mov state, #2
+    mov BCD_counter,#0   ;reset the counter
+    lcall Waitshort
+    
+state1_done:
+	Set_cursor(1, 7)
+	mov		a, state
+	Display_BCD(a)
+    ljmp loop_b
+
+state2:
+    cjne a, #2, state3
+    push acc
+    mov a, #0x24
+    mov HEX4, a
+    pop acc
+    mov pwm, #204
+    mov a, time_soak
+    clr c
+    subb a, BCD_counter
+    jnc state2_done
+    mov state, #3
+    lcall Waitshort
+    
+state2_done:
+	Set_cursor(1, 7)
+	mov		a, state
+	Display_BCD(a)
+    ljmp loop_b
+
+state3:
+    cjne a,#3,state4
+    push acc
+    mov a, #0x30
+    mov HEX4, a
+    pop acc
+	mov pwm,#0
+	mov BCD_counter,#0   ;reset the counter
+	mov a,#160   ;compare the temp with 220
+	clr c
+	subb a,temp
+	jnc state3_done
+	mov state,#4
+    lcall Waitshort
+
+state3_done:
+	Set_cursor(1, 7)
+	mov		a, state
+	Display_BCD(a)	
+    ljmp loop_b
+
+state4:
+   cjne a,#4,state5
+    push acc
+    mov a, #0x19
+    mov HEX4, a
+    pop acc
+   mov pwm,#204
+   mov a, #0x45       ;change the time to 45
+   clr c
+   subb a,BCD_counter      ;compare the time to 45
+   jnc state4_done
+   mov state,#5
+
+   lcall Waitlong
+
+state4_done:
+	Set_cursor(1, 7)
+	mov		a, state
+	Display_BCD(a)
+   ljmp loop_b
+
+state5:
+   cjne a,#5,ljstate0
+   sjmp state52
+ljstate0:
+   ljmp state0
+state52:      
+   push acc
+    mov a, #0x12
+    mov HEX4, a
+    pop acc
+   mov pwm,#255
+   mov a,#60
+   clr c
+   subb a,temp
+   jc state5_done
+   mov state,#0
+   lcall sixbeep
+state5_done:
+    Set_cursor(1, 7)
+	mov		a, state
+	Display_BCD(a)
+	ljmp loop_b
+
+loop_con:	
+        Set_Cursor(1, 1)	;Template
+    Send_Constant_String(#RTI)
+    
+    Set_Cursor(2, 1)	;Template
+    Send_Constant_String(#RTE)
+    
+    Set_Cursor(1, 9)	;Template
+    Send_Constant_String(#STI)
+    
+    Set_Cursor(2, 9)	;Template
+    Send_Constant_String(#STE)
+    
+    
+    
+    ; Display the initial value of each counter
+    
+    mov a, reflow_time
+    lcall Hex_to_bcd_8bit_RTI ; Converts hex reflow temperature to bcd and stores it into bcd+2 and bcd+1
+	Set_Cursor(1, 4)				;For RTI, Reflow TIme
+	Display_BCD(bcd+1)
+	Display_BCD(bcd+0)
+		
+	; Converts hex reflow temperature to bcd and stores it into bcd+3 and bcd+1	
+	mov a, reflow_temp
+    lcall Hex_to_bcd_8bit_RTE  		
+	Set_Cursor(2, 4)	
+	Display_BCD(bcd+3)
+	Display_BCD(bcd+2)
+	
+	; Converts hex soak time to bcd and stores it into bcd+5 and bcd+4	
+	mov a, soak_time
+    lcall Hex_to_bcd_8bit_STI  		
+	Set_Cursor(1, 12)	
+	Display_BCD(bcd+5)
+	Display_BCD(bcd+4)
+	
+	; Converts hex soak temperature to bcd and stores it into bcd+7 and bcd+6	
+	mov a, soak_temp
+    lcall Hex_to_bcd_8bit_STE  		
+	Set_Cursor(2, 12)	
+	Display_BCD(bcd+7)
+	Display_BCD(bcd+6)
+	
+	
+    ; Converts hex profile parameter to bcd and stores it into bcd+2 and bcd+1
+    lcall Display_BCD_7_Seg_HEX10
+    mov a, profile_parameter
+    lcall Hex_to
+	_bcd_8bit_PRO 		
+	
+	
+	
+    mov a, Count3
+    lcall Hex_to_bcd_8bit
+	lcall Display_BCD_7_Seg_HEX54
+	
+	
+	; After initialization the program stays in this 'forever' loop
+loop2:
+
+;-------------------------------------------------------------------------------
+; non-blocking state machine for KEY1 starts here
+	  jb KEY.2, loop_con2  ; if the KEY1 button is not pressed skip
+	Wait_Milli_Seconds(#50)	; Debounce delay.  This macro is also in 'LCD_4bit_DE1SoC.inc'
+	jb KEY.2, loop_con2  ; if the KEY1 button is not pressed skip
+	jnb KEY.2, $		; Wait for button release.  The '$' means: jump to same instruction.
+	ljmp loop_b
+loop_con2:
+	jnb half_seconds_flag, loop2
+	mov a, FSM1_state
+FSM1_state0:
+	cjne a, #0, FSM1_state1 ; If FSM1_STATE is not zero jump to FSM1_state1
+	jb KEY.1, FSM1_done		; If KEY.1 is 1, ie not pressed, jump to FSM1_done which is FSM2_state0, the start of non-blocking state machine for KEY2
+	;Else if KEY.1 == 0, ie. pressed
+	mov FSM1_timer, #0		; Mov zero to FSM1_timer
+	inc FSM1_state			; increment FSM1_state
+	sjmp FSM1_done			; Jump to the start of non_blocking state machine for KEY2
+FSM1_state1:
+	cjne a, #1, FSM1_state2
+	; this is the debounce state
+	mov a, FSM1_timer
+	cjne a, #50, FSM1_done ; 50 ms passed?
+	inc FSM1_state
+	sjmp FSM1_done	
+FSM1_state2:
+	cjne a, #2, FSM1_state3
+	jb KEY.1, FSM1_state2b
+	inc FSM1_state
+	sjmp FSM1_done	
+FSM1_state2b:
+	mov FSM1_state, #0
+	sjmp FSM1_done
+FSM1_state3:
+	cjne a, #3, FSM1_done
+	jnb KEY.1, FSM1_done
+	setb Key1_flag ; Suscesfully detected a valid KEY1 press/release
+	mov FSM1_state, #0	
+FSM1_done:
+;-------------------------------------------------------------------------------
+
+;-------------------------------------------------------------------------------
+; non-blocking state machine for KEY2 starts here
+	mov a, FSM2_state
+FSM2_state0:
+	cjne a, #0, FSM2_state1
+	jb KEY.2, FSM2_done
+	mov FSM2_timer, #0
+	inc FSM2_state
+	sjmp FSM2_done
+FSM2_state1:
+	cjne a, #1, FSM2_state2
+	; this is the debounce state
+	mov a, FSM2_timer
+	cjne a, #50, FSM2_done ; 50 ms passed?
+	inc FSM2_state
+	sjmp FSM2_done	
+FSM2_state2:
+	cjne a, #2, FSM2_state3
+	jb KEY.2, FSM2_state2b
+	inc FSM2_state
+	sjmp FSM2_done	
+FSM2_state2b:
+	mov FSM2_state, #0
+	sjmp FSM2_done
+FSM2_state3:
+	cjne a, #3, FSM2_done
+	jnb KEY.2, FSM2_done
+	setb Key2_flag ; Suscesfully detected a valid KEY2 press/release
+	mov FSM2_state, #0	
+FSM2_done:
+;-------------------------------------------------------------------------------
+
+;-------------------------------------------------------------------------------
+; non-blocking state machine for KEY3 starts here
+	mov a, FSM3_state
+FSM3_state0:
+	cjne a, #0, FSM3_state1
+	jb KEY.3, FSM3_done
+	mov FSM3_timer, #0
+	inc FSM3_state
+	sjmp FSM3_done
+FSM3_state1:
+	cjne a, #1, FSM3_state2
+	; this is the debounce state
+	mov a, FSM3_timer
+	cjne a, #50, FSM3_done ; 50 ms passed?
+	inc FSM3_state
+	sjmp FSM3_done	
+FSM3_state2:
+	cjne a, #2, FSM3_state3
+	jb KEY.3, FSM3_state2b
+	inc FSM3_state
+	sjmp FSM3_done	
+FSM3_state2b:
+	mov FSM3_state, #0
+	sjmp FSM3_done
+FSM3_state3:
+	cjne a, #3, FSM3_done
+	jnb KEY.3, FSM3_done
+	setb Key3_flag ; Suscesfully detected a valid KEY3 press/release
+	mov FSM3_state, #0	
+FSM3_done:
+;-------------------------------------------------------------------------------
+
+;-------------------------------------------------------------------------------
+; non-blocking FSM for the one second counter starts here.
+	mov a, FSM4_state
+	mov LEDRA, #0
+FSM4_state0:
+	cjne a, #0, FSM4_state1
+	setb LEDRA.0 ; We are using the LEDs to debug in what state is this machine
+	mov a, FSM4_timer
+	cjne a, #250, FSM4_done ; 250 ms passed? (Since we are usend an 8-bit variable, we need to count 250 ms four times)
+	mov FSM4_timer, #0
+	inc FSM4_state
+	sjmp FSM4_done
+FSM4_state1:	
+	cjne a, #1, FSM4_state2
+	setb LEDRA.1
+	mov a, FSM4_timer
+	cjne a, #250, FSM4_done ; 250 ms passed?
+	mov FSM4_timer, #0
+	inc FSM4_state
+	sjmp FSM4_done
+FSM4_state2:	
+	cjne a, #2, FSM4_state3
+	setb LEDRA.2
+	mov a, FSM4_timer
+	cjne a, #250, FSM4_done ; 250 ms passed?
+	mov FSM4_timer, #0
+	inc FSM4_state
+	sjmp FSM4_done
+FSM4_state3:	
+	cjne a, #3, FSM4_done
+	setb LEDRA.3
+	mov a, FSM4_timer
+	cjne a, #250, FSM4_done ; 250 ms passed?
+	mov FSM4_timer, #0
+	mov FSM4_state, #0
+	mov a, Count3
+	cjne a, #59, IncCount3 ; Don't let the seconds counter pass 59
+	mov Count3, #0
+	sjmp DisplayCount3
+IncCount3:
+	inc Count3
+DisplayCount3:
+    mov a, Count3
+    lcall Hex_to_bcd_8bit
+	lcall Display_BCD_7_Seg_HEX54
+	mov FSM4_state, #0
+FSM4_done:
+
+;======================================================================================    
+
+; If KEY1 was detected, increment or decrement Count1.  Notice that we are displying only
+; the least two signicant digits of a counter that can have values from 0 to 255.
+	jbc Key1_flag, Check_parameters0 ; Check which parameter to increment
+	ljmp Skip_parameters			 ; Skip_parameters means KEY1 is not pressed so ignore any incremenent and check KEY presses again
+
+Check_parameters0:
+	mov a, profile_parameter
+	cjne a, #0, Check_parameters1 ;If it's 0 Increment reflow_time
+Increment_reflow_time:	
+	mov  a, reflow_time		
+	cjne a, #75, Increment0 ; If not at 75, we can increment.
+	jb 	 SWA.0,  Decrement_reflow_time ; If it is 75, does user want Decrement? If so, decrement.
+	mov  a, #45  			; Otherwise reset reflow time to 45
+	mov  reflow_time, a		; Let's move 45 to reflow time to make sure it the actual value of variable.
+	sjmp Display_reflow_time
+Increment0:			
+	jb 	 SWA.0,  Decrement_reflow_time ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc reflow_time
+	sjmp Display_reflow_time
+Decrement_reflow_time:
+	cjne a, #45, Decrement0  ; If reflow_time is not at 45, allow decrement
+	jnb  SWA.0,  Increment0  ; If it is 45, does user want Increment? If so, increment.
+	mov  a, #75 	  ; Otherwise reset reflow time to 75
+	mov  reflow_time, a	
+	sjmp Display_reflow_time
+Decrement0:	
+	jnb 	 SWA.0,  Increment_reflow_time ; Does user actually want decrement? If so decrement, otherwise Jump to Increment Routine.
+	dec reflow_time
+Display_reflow_time:	
+    mov a, reflow_time
+    lcall Hex_to_bcd_8bit_RTI
+	Set_Cursor(1, 4)					; For LCD display
+	Display_BCD(bcd+1)					; need bcd cause it gets funky if I just use reflow_time variable. Value is moved in bcd+0 at Hex_to_bcd_8bit routine.
+	Display_BCD(bcd+0)
+    ljmp Skip_parameters
+;-------------------------------------------------------------------------------
+; Check if user wants to increment reflow_temp profile (aka parameter)
+Check_parameters1:
+	mov a, profile_parameter
+	cjne a, #1, Check_parameters2;If it's 1 Increment reflow_time, Check_parameters2
+	
+Increment_reflow_temp:
+	mov  a, reflow_temp		
+	cjne a, #240, Increment1 ; If not at 240, we can increment.
+	jb 	 SWA.0,  Decrement_reflow_temp ; If it is 240, does user want Decrement? If so, decrement.
+	mov  a, #217  			; Otherwise reset reflow temp to 217
+	mov  reflow_temp, a		; Let's move 217 to reflow temp to make sure it the actual value of variable.
+	sjmp Display_reflow_temp
+Increment1:			
+	jb 	 SWA.0,  Decrement_reflow_temp ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc reflow_temp
+	sjmp Display_reflow_temp
+Decrement_reflow_temp:
+	cjne a, #217, Decrement1  ; If reflow_temp is not at 217, allow decrement
+	jnb  SWA.0,  Increment1  ; If it is 217, does user want Increment? If so, increment.
+	mov  a, #240 	  		 ; Otherwise reset reflow time to 240
+	mov  reflow_temp, a	
+	sjmp Display_reflow_temp
+Decrement1:	
+	jnb 	 SWA.0,  Increment_reflow_temp ; Does user actually want decrement? If so decrement, otherwise jump to Increment Routine.
+	dec reflow_temp
+Display_reflow_temp:	
+    mov a, reflow_temp
+	lcall Hex_to_bcd_8bit_RTE		; Puts the result from Hex_to_bcd conversion into bcd+1 and bcd+2
+	Set_Cursor(2, 4)	
+	Display_BCD(bcd+3)
+	Display_BCD(bcd+2)	
+	ljmp Skip_parameters
+
+;-------------------------------------------------------------------------------   
+; Check if user wants to increment soak time profile 
+Check_parameters2:
+	mov a, profile_parameter
+	cjne a, #2, Check_parameters3;If it's 2 Increment soak_time, Check_parameters3
+	
+Increment_soak_time:
+	mov  a, soak_time	
+	cjne a, #120, Increment2 ; If not at 240, we can increment.
+	jb 	 SWA.0,  Decrement_soak_time  ; If it is 240, does user want Decrement? If so, decrement.
+	mov  a, #60  			; Otherwise reset reflow temp to 217
+	mov  soak_time, a		; Let's move 217 to reflow temp to make sure it the actual value of variable.
+	sjmp Display_soak_time
+Increment2:			
+	jb 	 SWA.0,  Decrement_soak_time ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc soak_time
+	sjmp Display_soak_time
+Decrement_soak_time:
+	cjne a, #60, Decrement2  ; If soak_time is not at 217, allow decrement
+	jnb  SWA.0,  Increment2  ; If it is 217, does user want Increment? If so, increment.
+	mov  a, #120 	  		 ; Otherwise reset reflow time to 240
+	mov  soak_time, a	
+	sjmp Display_soak_time
+	
+Decrement2:	
+	jnb SWA.0,  Increment_soak_time ; Does user actually want decrement? If so decrement, otherwise jump to Increment Routine.
+	dec soak_time
+Display_soak_time:	
+    mov a, soak_time
+	lcall Hex_to_bcd_8bit_STI		; Puts the result from Hex_to_bcd conversion into bcd+5 and bcd+4
+	Set_Cursor(1, 12)	
+	Display_BCD(bcd+5)
+	Display_BCD(bcd+4)	
+	
+	ljmp Skip_parameters
+
+;-------------------------------------------------------------------------------   
+; Check if user wants to increment soak temperature profile 
+Check_parameters3:
+	mov a, profile_parameter
+	cjne a, #3, Skip_parameters;If it's 3 Increment soak_temp, else check for KEYS are pressed by jumping to Skip_parameters 
+	
+Increment_soak_temp:
+	mov  a, soak_temp	
+	cjne a, #170, Increment3 ; If not at 240, we can increment.
+	jb 	 SWA.0,  Decrement_soak_temp  ; If it is 240, does user want Decrement? If so, decrement.
+	mov  a, #130  			; Otherwise reset reflow temp to 217
+	mov  soak_temp, a		; Let's move 217 to reflow temp to make sure it the actual value of variable.
+	sjmp Display_soak_temp
+Increment3:			
+	jb 	 SWA.0,  Decrement_soak_temp ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc soak_temp
+	sjmp Display_soak_temp
+Decrement_soak_temp:
+	cjne a, #130, Decrement3  ; If soak_temp is not at 217, allow decrement
+	jnb  SWA.0,  Increment3  ; If it is 217, does user want Increment? If so, increment.
+	mov  a, #170 	  		 ; Otherwise reset reflow time to 240
+	mov  soak_temp, a	
+	sjmp Display_soak_temp
+	
+Decrement3:	
+	jnb SWA.0,  Increment_soak_temp ; Does user actually want decrement? If so decrement, otherwise jump to Increment Routine.
+	dec soak_temp
+Display_soak_temp:	
+    mov a, soak_temp
+	lcall Hex_to_bcd_8bit_STE		; Puts the result from Hex_to_bcd conversion into bcd+7 and bcd+6
+	Set_Cursor(2, 12)	
+	Display_BCD(bcd+7)
+	Display_BCD(bcd+6)	
+;------------------------------------------------------------------------------- 
+
+Skip_parameters:
+;======================================================================================    	
+; When KEY2 is pressed/released it resets the one second counter (Count3)
+;Selects profile parameter: reflow time, reflow temp, soak time, and reflow temp
+	jbc Key2_flag, Increment_profile_parameter
+	sjmp Skip_profile_parameter
+Increment_profile_parameter:
+	mov  a, profile_parameter		
+	cjne a, #3, Increment5 ; If not at 3, we can increment.
+	jb 	 SWA.0,  Decrement_profile_parameter ; If it is 3, does user want Decrement? If so, decrement.
+	mov  a, #0  			; Otherwise reset reflow temp to 0
+	mov  profile_parameter, a		; Let's move 0 to reflow temp to make sure it the actual value of variable.
+	sjmp Display_profile_parameter
+Increment5:			
+	jb 	 SWA.0,  Decrement_profile_parameter ; Does user actually want increment? If so increment, otherwise Jump to Decrement Routine.	
+	inc profile_parameter
+	sjmp Display_profile_parameter
+Decrement_profile_parameter:
+	cjne a, #0, Decrement5  ; If profile_paramter is not at 0, allow decrement
+	jnb  SWA.0,  Increment5  ; If it is 0, does user want Increment? If so, increment.
+	mov  a, #3 	  		 ; Otherwise reset profile_paramter to 3
+	mov  profile_parameter, a	
+	sjmp Display_profile_parameter
+Decrement5:	
+	jnb 	 SWA.0,  Increment_profile_parameter ; Does user actually want decrement? If so decrement, otherwise jump to Increment Routine.
+	dec profile_parameter
+Display_profile_parameter:	
+	lcall Display_BCD_7_Seg_HEX10
+	
+Skip_profile_parameter:
+    ljmp loop
+END
